@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import List, Dict
 from config import Config
 
-AGENT_VERSION = "1.3.3"
+AGENT_VERSION = "1.3.4"
 
 try:
     import psutil
@@ -428,7 +428,20 @@ class ObservabilityAgent:
             self.logger.warning(f"Auto-update check failed: {e}")
 
     def _perform_update(self):
-        """Download and run the upgrade script to update this agent in place."""
+        """
+        Download the upgrade script and launch it in a detached systemd scope.
+
+        The upgrade script's own first step is `systemctl stop watchdock-agent`.
+        This process runs *inside* that service's cgroup (KillMode=control-group
+        is the systemd default), so running the script as a direct child
+        subprocess would kill it mid-flight the instant it issues that stop —
+        it never gets to extract the new files or start the service again.
+        `systemd-run` launches it as an independent transient unit with its own
+        cgroup, so it survives being orphaned when this service (and this
+        process) goes down. We deliberately don't wait for the upgrade itself
+        to finish — only for `systemd-run` to confirm it launched — since this
+        process won't be alive to see the result either way.
+        """
         import subprocess
         import tempfile
 
@@ -448,15 +461,25 @@ class ObservabilityAgent:
             import os
             os.chmod(script_path, 0o755)
             result = subprocess.run(
-                ["sudo", "bash", script_path],
+                [
+                    "systemd-run",
+                    "--unit=watchdock-agent-upgrade",
+                    "--collect",
+                    "--",
+                    "bash",
+                    script_path,
+                ],
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=15,
             )
             if result.returncode == 0:
-                self.logger.info("Auto-update completed — agent service will restart momentarily")
+                self.logger.info(
+                    "Auto-update launched in a detached scope — this process and the "
+                    "old service will stop shortly; the new version starts automatically"
+                )
             else:
-                self.logger.error(f"Auto-update script failed: {result.stderr[:500]}")
+                self.logger.error(f"Failed to launch auto-update: {result.stderr[:500]}")
         except Exception as e:
             self.logger.error(f"Auto-update failed: {e}")
 
