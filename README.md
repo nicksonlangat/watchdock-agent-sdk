@@ -39,6 +39,7 @@ Your server will appear in the dashboard within 60 seconds.
 ### Nginx Access/Error Logs
 - Tails nginx access and error logs using the `watchdock` log format
 - Captures nginx's built-in `$request_id` per request when present in the format, letting the dashboard correlate a request with the exact `watchdock-errors` SDK event it produced (see [docs](https://watchdock.cc/docs/nginx-log-collection))
+- Read offsets are persisted to disk (`.nginx_positions.json` next to the config file) and only advance after a successful send, so a restart or a failed/oversized delivery never silently drops log lines — at most it retries and sends a few duplicates
 
 ---
 
