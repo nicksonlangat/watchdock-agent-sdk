@@ -36,6 +36,10 @@ Your server will appear in the dashboard within 60 seconds.
 - Batched delivery for efficiency
 - Handles log rotation gracefully
 
+### Nginx Access/Error Logs
+- Tails nginx access and error logs using the `watchdock` log format
+- Captures nginx's built-in `$request_id` per request when present in the format, letting the dashboard correlate a request with the exact `watchdock-errors` SDK event it produced (see [docs](https://watchdock.cc/docs/nginx-log-collection))
+
 ---
 
 ## Configuration

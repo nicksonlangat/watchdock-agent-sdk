@@ -16,10 +16,13 @@ import requests
 
 
 # Watchdock access log format:
-# $remote_addr [$time_local] "$request" $status $body_bytes_sent $request_time $upstream_response_time
-# Example: 203.0.113.1 [26/Feb/2026:10:23:01 +0000] "GET /api/ HTTP/1.1" 200 1234 0.043 0.041
+# $remote_addr [$time_local] "$request" $status $body_bytes_sent $request_time $upstream_response_time $request_id
+# Example: 203.0.113.1 [26/Feb/2026:10:23:01 +0000] "GET /api/ HTTP/1.1" 200 1234 0.043 0.041 5f8a9c3e1b2d4f6a8c9e0d1f2a3b4c5d
+#
+# $request_id is trailing and optional for backward compatibility: sources still using the
+# older format (without it) keep working, they just won't get error/request correlation.
 ACCESS_LOG_RE = re.compile(
-    r'^(\S+) \[([^\]]+)\] "(\S+) (\S+)[^"]*" (\d+) (\d+) ([\d.]+|-) ([\d.]+|-)'
+    r'^(\S+) \[([^\]]+)\] "(\S+) (\S+)[^"]*" (\d+) (\d+) ([\d.]+|-) ([\d.]+|-)(?:\s+(\S+))?'
 )
 
 # Nginx error log format:
@@ -139,7 +142,7 @@ class NginxLogCollector:
         if not match:
             return None
 
-        ip_address, time_local, method, raw_path, status_str, bytes_str, rt_str, _ = (
+        ip_address, time_local, method, raw_path, status_str, bytes_str, rt_str, _, request_id = (
             match.group(1),
             match.group(2),
             match.group(3),
@@ -148,6 +151,7 @@ class NginxLogCollector:
             match.group(6),
             match.group(7),
             match.group(8),
+            match.group(9),
         )
 
         # Parse timestamp. Format: 26/Feb/2026:10:23:01 +0000
@@ -164,7 +168,7 @@ class NginxLogCollector:
         bytes_sent = int(bytes_str)
         response_ms = round(float(rt_str) * 1000, 2) if rt_str != "-" else None
 
-        return {
+        event = {
             "timestamp": ts.isoformat(),
             "ip_address": ip_address,
             "method": method.upper(),
@@ -173,6 +177,9 @@ class NginxLogCollector:
             "response_ms": response_ms,
             "bytes_sent": bytes_sent,
         }
+        if request_id:
+            event["trace_id"] = request_id
+        return event
 
     def _parse_access_lines(self, lines: List[str], prefix: str) -> List[dict]:
         """
