@@ -114,6 +114,7 @@ setup_agent_files() {
     cp log_parser.py "$AGENT_DIR/"
     cp docker_monitor.py "$AGENT_DIR/"
     cp container_log_collector.py "$AGENT_DIR/"
+    cp nginx_log_collector.py "$AGENT_DIR/"
     cp requirements.txt "$AGENT_DIR/"
 
     # Make agent executable

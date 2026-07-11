@@ -108,6 +108,7 @@ cp config.py "$AGENT_DIR/"
 cp log_parser.py "$AGENT_DIR/"
 cp docker_monitor.py "$AGENT_DIR/" 2>/dev/null || true
 cp container_log_collector.py "$AGENT_DIR/" 2>/dev/null || true
+cp nginx_log_collector.py "$AGENT_DIR/" 2>/dev/null || true
 cp requirements.txt "$AGENT_DIR/"
 
 # Update VERSION file
