@@ -10,7 +10,7 @@ VERSION="${1:-latest}"
 AGENT_DIR="/opt/watchdock-agent"
 SERVICE_NAME="watchdock-agent"
 BACKUP_DIR="/opt/watchdock-agent-backup-$(date +%Y%m%d-%H%M%S)"
-REPO_URL="https://github.com/nicksonlangat/platform_obs_agent"
+REPO_URL="https://github.com/nicksonlangat/watchdock-agent-sdk"
 
 # Colors
 RED='\033[0;31m'

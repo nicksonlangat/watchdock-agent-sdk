@@ -117,11 +117,11 @@ UPGRADING TO NEW VERSION
 ────────────────────────────────────────────────────────────────
 No need to reconfigure! Just run:
 
-    curl -sSL https://github.com/nicksonlangat/platform_obs_agent/releases/latest/download/upgrade.sh | sudo bash
+    curl -sSL https://github.com/nicksonlangat/watchdock-agent-sdk/releases/latest/download/upgrade.sh | sudo bash
 
 Or manual upgrade:
 
-    wget https://github.com/nicksonlangat/platform_obs_agent/releases/latest/download/upgrade.sh
+    wget https://github.com/nicksonlangat/watchdock-agent-sdk/releases/latest/download/upgrade.sh
     sudo bash upgrade.sh
 
 This will:
@@ -168,7 +168,7 @@ SHA256: ${TARBALL_CHECKSUM}
 
 Installation Instructions:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-wget https://github.com/nicksonlangat/platform_obs_agent/releases/download/agent-v${AGENT_VERSION}/${OUTPUT_FILE}
+wget https://github.com/nicksonlangat/watchdock-agent-sdk/releases/download/agent-v${AGENT_VERSION}/${OUTPUT_FILE}
 tar -xzf ${OUTPUT_FILE}
 cd ${RELEASE_NAME}
 cp agent_config.json.example agent_config.json

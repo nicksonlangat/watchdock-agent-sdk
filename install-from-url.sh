@@ -6,7 +6,7 @@ set -e
 
 API_TOKEN="${1}"
 VERSION="${2:-latest}"
-REPO_URL="https://github.com/nicksonlangat/platform_obs_agent"
+REPO_URL="https://github.com/nicksonlangat/watchdock-agent-sdk"
 DOWNLOAD_URL="${REPO_URL}/releases/download/agent-v${VERSION}/watchdock-agent-${VERSION}.tar.gz"
 
 # Colors
