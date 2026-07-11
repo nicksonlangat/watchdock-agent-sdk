@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import List, Dict
 from config import Config
 
-AGENT_VERSION = "1.3.1"
+AGENT_VERSION = "1.3.2"
 
 try:
     import psutil
@@ -432,7 +432,13 @@ class ObservabilityAgent:
         import subprocess
         import tempfile
 
-        upgrade_url = f"{self.config.get('api_endpoint', '').replace('/api', '')}/upgrade.sh"
+        # Strip only a trailing "/api" path segment. A naive .replace("/api", "")
+        # also matches the "/api" hiding inside "https://api.watchdock.cc" (the
+        # second slash of "//" plus the "api" subdomain), mangling the host
+        # entirely — e.g. producing "https:/.watchdock.cc" with no host at all.
+        api_endpoint = self.config.get('api_endpoint', '').rstrip('/')
+        base_url = api_endpoint[: -len('/api')] if api_endpoint.endswith('/api') else api_endpoint
+        upgrade_url = f"{base_url}/upgrade.sh"
         try:
             resp = requests.get(upgrade_url, timeout=15)
             resp.raise_for_status()
