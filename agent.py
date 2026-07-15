@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import List, Dict
 from config import Config
 
-AGENT_VERSION = "1.3.6"
+AGENT_VERSION = "1.3.7"
 
 try:
     import psutil
@@ -117,6 +117,13 @@ class ObservabilityAgent:
             self.logger.info("Container log collection enabled")
         else:
             self.logger.info("Container log collection disabled")
+
+        # Start Docker command polling thread (always runs when Docker is available)
+        if DOCKER_MONITOR_AVAILABLE and self.docker_monitor and self.docker_monitor.docker_available:
+            cmd_thread = threading.Thread(target=self._docker_command_loop)
+            cmd_thread.daemon = True
+            cmd_thread.start()
+            self.logger.info("Docker command execution enabled")
 
         # Start nginx log collection thread (collect_and_send handles empty sources gracefully)
         if NGINX_LOG_COLLECTOR_AVAILABLE and self.nginx_log_collector:
@@ -396,6 +403,69 @@ class ObservabilityAgent:
             except Exception as e:
                 self.logger.error(f"Error in container log collection loop: {e}")
             time.sleep(self.config.get('container_log_interval', 30))
+
+    def _docker_command_loop(self):
+        """Poll for pending Docker commands and execute them."""
+        import subprocess
+
+        self.logger.info("Starting Docker command polling loop")
+        api_token = self.config.get("api_token")
+        machine_id = self.config.get_machine_id()
+
+        while self.running:
+            try:
+                resp = requests.get(
+                    f"{self.config.get('api_endpoint')}/core/agent/docker-commands/",
+                    params={"machine_id": machine_id},
+                    headers={"Authorization": f"Bearer {api_token}"},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    commands = resp.json().get("commands", [])
+                    for cmd in commands:
+                        self._execute_docker_command(cmd, api_token, subprocess)
+            except Exception as e:
+                self.logger.debug(f"Docker command poll error: {e}")
+            time.sleep(5)
+
+    def _execute_docker_command(self, cmd, api_token, subprocess):
+        command_id = cmd["id"]
+        action = cmd["action"]
+        container_id = cmd["container_id"]
+        container_name = cmd.get("container_name", container_id)
+
+        self.logger.info(f"Executing docker {action} on {container_name}")
+        try:
+            result = subprocess.run(
+                ["docker", action, container_id],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                result_status = "completed"
+                message = result.stdout.strip() or f"docker {action} succeeded"
+            else:
+                result_status = "failed"
+                message = result.stderr.strip() or f"docker {action} exited with code {result.returncode}"
+        except subprocess.TimeoutExpired:
+            result_status = "failed"
+            message = f"docker {action} timed out after 30s"
+        except Exception as exc:
+            result_status = "failed"
+            message = str(exc)
+
+        try:
+            requests.post(
+                f"{self.config.get('api_endpoint')}/core/agent/docker-commands/{command_id}/result/",
+                json={"status": result_status, "message": message},
+                headers={"Authorization": f"Bearer {api_token}"},
+                timeout=10,
+            )
+        except Exception as e:
+            self.logger.warning(f"Failed to report command result: {e}")
+
+        self.logger.info(f"docker {action} {container_name}: {result_status} — {message[:120]}")
 
     def _nginx_log_collection_loop(self):
         """Periodically collect and send nginx access metrics and error events"""
