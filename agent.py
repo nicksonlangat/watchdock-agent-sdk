@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import List, Dict
 from config import Config
 
-AGENT_VERSION = "1.3.7"
+AGENT_VERSION = "1.3.8"
 
 try:
     import psutil
@@ -431,16 +431,23 @@ class ObservabilityAgent:
     def _execute_docker_command(self, cmd, api_token, subprocess):
         command_id = cmd["id"]
         action = cmd["action"]
-        container_id = cmd["container_id"]
-        container_name = cmd.get("container_name", container_id)
+        container_id = cmd.get("container_id", "")
+        container_name = cmd.get("container_name", "") or container_id
 
-        self.logger.info(f"Executing docker {action} on {container_name}")
+        if action == "prune":
+            cmd_args = ["docker", "system", "prune", "-f"]
+            log_label = "system"
+        else:
+            cmd_args = ["docker", action, container_id]
+            log_label = container_name
+
+        self.logger.info(f"Executing docker {action} on {log_label}")
         try:
             result = subprocess.run(
-                ["docker", action, container_id],
+                cmd_args,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=120,
             )
             if result.returncode == 0:
                 result_status = "completed"
@@ -450,7 +457,7 @@ class ObservabilityAgent:
                 message = result.stderr.strip() or f"docker {action} exited with code {result.returncode}"
         except subprocess.TimeoutExpired:
             result_status = "failed"
-            message = f"docker {action} timed out after 30s"
+            message = f"docker {action} timed out after 120s"
         except Exception as exc:
             result_status = "failed"
             message = str(exc)
@@ -465,7 +472,7 @@ class ObservabilityAgent:
         except Exception as e:
             self.logger.warning(f"Failed to report command result: {e}")
 
-        self.logger.info(f"docker {action} {container_name}: {result_status} — {message[:120]}")
+        self.logger.info(f"docker {action} {log_label}: {result_status} — {message[:120]}")
 
     def _nginx_log_collection_loop(self):
         """Periodically collect and send nginx access metrics and error events"""
