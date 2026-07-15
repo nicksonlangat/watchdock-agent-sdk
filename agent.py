@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import List, Dict
 from config import Config
 
-AGENT_VERSION = "1.3.8"
+AGENT_VERSION = "1.3.9"
 
 try:
     import psutil
@@ -447,7 +447,7 @@ class ObservabilityAgent:
                 cmd_args,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=300,
             )
             if result.returncode == 0:
                 result_status = "completed"
@@ -457,7 +457,7 @@ class ObservabilityAgent:
                 message = result.stderr.strip() or f"docker {action} exited with code {result.returncode}"
         except subprocess.TimeoutExpired:
             result_status = "failed"
-            message = f"docker {action} timed out after 120s"
+            message = f"docker {action} timed out after 300s"
         except Exception as exc:
             result_status = "failed"
             message = str(exc)
