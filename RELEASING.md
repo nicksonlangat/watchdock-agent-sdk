@@ -47,3 +47,28 @@ Go to **Actions → Release Agent → Run workflow** and enter the version numbe
 - [ ] `agent_version` in `agent.py` matches the tag
 - [ ] All changes committed and pushed to `main`
 - [ ] No sensitive data or credentials in the diff
+
+---
+
+## Baking a VM image with the agent pre-installed
+
+Since 1.4.0 the agent stores a persistent `agent_id` in `agent_config.json`, and that is how the backend tells one server from another. If you snapshot or create an AMI from a box that already has the agent installed, the image carries that `agent_id` (and `/etc/machine-id`), so every VM cloned from it reports the same identity and they all collapse into one server record. The extra boxes then look invisible in the dashboard.
+
+Before creating the image, clear both identifiers so each clone generates its own on first boot:
+
+```bash
+sudo systemctl stop watchdock-agent
+# Drop the agent's pinned identity
+sudo python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path("/opt/watchdock-agent/agent_config.json")
+c = json.loads(p.read_text())
+c.pop("agent_id", None)
+p.write_text(json.dumps(c, indent=2))
+PY
+# Drop the systemd machine-id so the OS regenerates it per clone
+sudo truncate -s 0 /etc/machine-id
+sudo rm -f /var/lib/dbus/machine-id
+```
+
+On first boot each clone regenerates `/etc/machine-id`, the agent finds no `agent_id`, adopts that fresh machine-id, and registers as its own server. This only matters for image/snapshot workflows; installing the agent per box already gives each one a unique `agent_id`.
