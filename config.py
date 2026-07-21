@@ -67,28 +67,49 @@ class Config:
 
     def get_machine_id(self) -> str:
         """
-        Get unique machine identifier. Tries multiple methods:
-        1. /etc/machine-id (Linux)
-        2. /var/lib/dbus/machine-id (Linux)
-        3. Generated UUID based on hostname + MAC address (fallback)
+        Return this agent's stable identity, used server-side as the LogSource key.
+
+        Resolution order:
+        1. agent_id persisted in the config. Once set, this is authoritative and
+           never changes, even if /etc/machine-id or the hostname later change.
+        2. Otherwise resolve the legacy identity exactly as older agents did
+           (/etc/machine-id, then /var/lib/dbus/machine-id, then a uuid5 of the
+           hostname) and persist it as agent_id.
+
+        Branch 2 is what makes upgrades lossless: an existing agent keeps reporting
+        the same string it always has, so its server-side record is preserved
+        rather than split into a new one. Fresh installs are seeded with a random
+        agent_id by the installer, so they take branch 1 and never collide with a
+        cloned machine-id.
         """
         if self._machine_id:
             return self._machine_id
 
-        # Try Linux machine-id files
-        machine_id_paths = ['/etc/machine-id', '/var/lib/dbus/machine-id']
-        for path in machine_id_paths:
+        stored = self.config.get("agent_id")
+        if stored:
+            self._machine_id = stored
+            return self._machine_id
+
+        self._machine_id = self._resolve_legacy_machine_id()
+        try:
+            self.set("agent_id", self._machine_id)  # persist so identity is pinned
+        except OSError as exc:
+            logger.warning("Could not persist agent_id to config: %s", exc)
+        return self._machine_id
+
+    def _resolve_legacy_machine_id(self) -> str:
+        """Reproduce the historical identity derivation for existing installs."""
+        for path in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
             try:
                 with open(path, 'r') as f:
-                    self._machine_id = f.read().strip()
-                    return self._machine_id
+                    value = f.read().strip()
+                    if value:
+                        return value
             except (FileNotFoundError, PermissionError):
                 continue
 
-        # Fallback: Generate stable ID from hostname
-        hostname = self.get_hostname()
-        self._machine_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, hostname))
-        return self._machine_id
+        # Fallback: stable ID from hostname (matches older agent behaviour).
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, self.get_hostname()))
 
     def get_hostname(self) -> str:
         """Get the system hostname"""

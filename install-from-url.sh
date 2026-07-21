@@ -66,10 +66,21 @@ cd watchdock-agent-*/
 
 # Create config
 log "Creating configuration..."
+# Give every fresh install its own random identity so that a box cloned from a
+# snapshot cannot share another server's machine-id. Existing installs keep
+# their identity via the agent's own adoption logic (see config.get_machine_id).
+if [[ -r /proc/sys/kernel/random/uuid ]]; then
+  AGENT_ID="$(cat /proc/sys/kernel/random/uuid)"
+elif command -v uuidgen >/dev/null 2>&1; then
+  AGENT_ID="$(uuidgen)"
+else
+  AGENT_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+fi
 cat > agent_config.json << EOF
 {
   "api_endpoint": "https://api.watchdock.cc/api",
   "api_token": "${API_TOKEN}",
+  "agent_id": "${AGENT_ID}",
   "log_files": [],
   "collect_metrics": true,
   "metrics_interval": 300,
