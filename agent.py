@@ -506,18 +506,29 @@ class ObservabilityAgent:
 
     def _perform_update(self):
         """
-        Download the upgrade script and launch it in a detached systemd scope.
+        Download the upgrade script and launch it as an independent systemd unit.
 
-        The upgrade script's own first step is `systemctl stop watchdock-agent`.
-        This process runs *inside* that service's cgroup (KillMode=control-group
-        is the systemd default), so running the script as a direct child
-        subprocess would kill it mid-flight the instant it issues that stop —
-        it never gets to extract the new files or start the service again.
-        `systemd-run` launches it as an independent transient unit with its own
-        cgroup, so it survives being orphaned when this service (and this
-        process) goes down. We deliberately don't wait for the upgrade itself
-        to finish — only for `systemd-run` to confirm it launched — since this
-        process won't be alive to see the result either way.
+        The upgrade's first step is `systemctl stop watchdock-agent`: it stops
+        the very service this process runs under, then swaps the files and
+        starts it again. So the upgrade has to *outlive* this process. Launched
+        as an ordinary child it is coupled to this service and gets torn down
+        with it before it can finish extracting the new files or restarting the
+        service — auto-update did exactly this to itself until it was fixed. A
+        child would also inherit this service's sandbox (ProtectSystem=strict,
+        PrivateTmp, ProtectHome), which is not where a system upgrade should run.
+
+        `systemd-run --collect` launches it as its own transient unit, in its
+        own cgroup and outside this service's sandbox, so it survives this
+        service (and this process) going down and has the access it needs. We
+        deliberately don't wait for the upgrade to finish — only for
+        `systemd-run` to confirm the launch — since this process won't be alive
+        to see the result either way.
+
+        (An earlier version of this note blamed `KillMode=control-group` being
+        the systemd default. That was inaccurate: the service explicitly sets
+        `KillMode=process` in install.sh, so stopping it never killed the child
+        via the cgroup. The detached unit is required regardless, for the
+        reasons above.)
         """
         import subprocess
         import tempfile
