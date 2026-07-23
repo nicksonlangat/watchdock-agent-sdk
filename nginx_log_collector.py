@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -38,6 +39,16 @@ ERROR_LOG_RE = re.compile(
 # enough to get rejected with 413, which would otherwise drop the whole batch.
 MAX_EVENTS_PER_BATCH = 200
 
+# A source that's over its plan's monthly log limit gets HTTP 429 on every
+# send no matter how often we retry. Without backing off, a stalled source
+# still gets its (ever-growing) unsent backlog re-read and re-parsed every
+# single cycle for nothing — the actual cost that motivated this backoff.
+# Starts short so a transient/borderline limit recovers quickly, doubles on
+# each further 429 to a 1-hour ceiling either because the calendar month
+# rolled over or because the plan limit was raised.
+QUOTA_BACKOFF_INITIAL_SECONDS = 300
+QUOTA_BACKOFF_MAX_SECONDS = 3600
+
 
 class NginxLogCollector:
     """
@@ -52,6 +63,13 @@ class NginxLogCollector:
     advances once every source that reads it has sent successfully — a
     partial failure just means some events get retried next cycle rather
     than lost.
+
+    A source whose organization is over its plan's monthly nginx-log limit
+    gets backed off (see QUOTA_BACKOFF_*) instead of being retried every
+    cycle: its send will fail regardless, so retrying immediately only buys
+    another full read-and-parse of its unsent backlog for nothing. Backoff
+    state is in-memory only (reset on restart) and keyed by source id, not
+    path — see collect_and_send for how that interacts with path sharing.
     """
 
     def __init__(self, config):
@@ -60,6 +78,11 @@ class NginxLogCollector:
         self._state_path = self._resolve_state_path()
         # Byte offsets keyed by file path, persisted across restarts.
         self._file_positions: Dict[str, int] = self._load_positions()
+        # source_id -> (monotonic time backoff ends, current backoff duration).
+        # The duration is kept alongside the deadline so a repeat 429 after
+        # this backoff expires can double it rather than restarting at the
+        # initial value.
+        self._quota_backoff: Dict[str, Tuple[float, float]] = {}
 
     def _resolve_state_path(self) -> str:
         config_file = getattr(self.config, "config_file", "agent_config.json")
@@ -84,6 +107,40 @@ class NginxLogCollector:
             self.logger.warning(f"Could not persist nginx file positions: {e}")
 
     # ------------------------------------------------------------------
+    # Quota backoff
+    # ------------------------------------------------------------------
+
+    def _is_backed_off(self, source_id: str) -> bool:
+        entry = self._quota_backoff.get(source_id)
+        return entry is not None and time.monotonic() < entry[0]
+
+    def _register_quota_exceeded(self, source_id: str) -> None:
+        """Start or extend backoff for a source that just got HTTP 429.
+
+        A no-op if it's already backing off: a large unsent backlog can
+        span many chunks, and every chunk in the same cycle will also come
+        back 429 — without this guard each of those would double the
+        duration in turn, so one over-limit cycle could jump straight to
+        the 1-hour ceiling instead of the intended gradual ramp.
+        """
+        if self._is_backed_off(source_id):
+            return
+        _, prev_duration = self._quota_backoff.get(source_id, (0.0, 0.0))
+        duration = (
+            min(prev_duration * 2, QUOTA_BACKOFF_MAX_SECONDS)
+            if prev_duration
+            else QUOTA_BACKOFF_INITIAL_SECONDS
+        )
+        self._quota_backoff[source_id] = (time.monotonic() + duration, duration)
+        self.logger.info(
+            f"Nginx source {source_id} is over its plan's monthly log limit; "
+            f"backing off for {int(duration)}s instead of retrying every cycle"
+        )
+
+    def _clear_backoff(self, source_id: str) -> None:
+        self._quota_backoff.pop(source_id, None)
+
+    # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
@@ -98,9 +155,27 @@ class NginxLogCollector:
         if not nginx_sources:
             return
 
-        # Read each unique file path exactly once per cycle. Reading does not
-        # mutate self._file_positions yet — that only happens once we know
-        # every consumer of a path succeeded.
+        # A path is "active" this cycle only if every source referencing it
+        # is within its plan's limit. If even one is backed off, the whole
+        # path is skipped rather than reading it for its healthy sibling:
+        # the offset is committed per-path (see below), so advancing it on
+        # the sibling's success alone would silently skip past the backed-
+        # off source's unprocessed share once its backoff clears. Skipping
+        # the read entirely is also the actual point of backing off — a
+        # source with no active path never gets its backlog re-parsed.
+        path_sources: Dict[str, List[dict]] = {}
+        for source in nginx_sources:
+            for path in (source["access_log_path"], source["error_log_path"]):
+                path_sources.setdefault(path, []).append(source)
+        active_paths = {
+            path
+            for path, sources in path_sources.items()
+            if not any(self._is_backed_off(s["id"]) for s in sources)
+        }
+
+        # Read each unique active file path exactly once per cycle. Reading
+        # does not mutate self._file_positions yet — that only happens once
+        # we know every consumer of a path succeeded.
         access_lines_by_path: Dict[str, Tuple[List[str], int]] = {}
         error_lines_by_path: Dict[str, Tuple[List[str], int]] = {}
         path_succeeded: Dict[str, bool] = {}
@@ -110,7 +185,7 @@ class NginxLogCollector:
                 (access_lines_by_path, source["access_log_path"]),
                 (error_lines_by_path, source["error_log_path"]),
             ]:
-                if path not in store:
+                if path not in store and path in active_paths:
                     store[path] = self._read_new_lines(path)
                     path_succeeded[path] = True
 
@@ -330,14 +405,18 @@ class NginxLogCollector:
                 timeout=30,
             )
             if response.status_code in (200, 201):
+                self._clear_backoff(source_id)
                 self.logger.debug(
                     f"Sent {len(events)} events to {endpoint} for source {source_id}"
                 )
                 return True
 
-            self.logger.warning(
-                f"Failed to send {endpoint}: {response.status_code} - {response.text[:500]}"
-            )
+            if response.status_code == 429:
+                self._register_quota_exceeded(source_id)
+            else:
+                self.logger.warning(
+                    f"Failed to send {endpoint}: {response.status_code} - {response.text[:500]}"
+                )
             return False
         except Exception as e:
             self.logger.error(f"Error sending {endpoint}: {e}")
