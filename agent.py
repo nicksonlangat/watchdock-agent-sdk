@@ -441,13 +441,14 @@ class ObservabilityAgent:
             cmd_args = ["docker", action, container_id]
             log_label = container_name
 
+        docker_timeout = 1800  # docker system prune on large servers can take many minutes
         self.logger.info(f"Executing docker {action} on {log_label}")
         try:
             result = subprocess.run(
                 cmd_args,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=docker_timeout,
             )
             if result.returncode == 0:
                 result_status = "completed"
@@ -457,7 +458,7 @@ class ObservabilityAgent:
                 message = result.stderr.strip() or f"docker {action} exited with code {result.returncode}"
         except subprocess.TimeoutExpired:
             result_status = "failed"
-            message = f"docker {action} timed out after 300s"
+            message = f"docker {action} timed out after {docker_timeout}s"
         except Exception as exc:
             result_status = "failed"
             message = str(exc)
