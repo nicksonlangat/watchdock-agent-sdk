@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import List, Dict
 from config import Config
 
-AGENT_VERSION = "1.4.1"
+AGENT_VERSION = "1.4.2"
 
 try:
     import psutil
