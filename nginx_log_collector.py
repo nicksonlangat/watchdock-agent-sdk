@@ -27,6 +27,20 @@ ACCESS_LOG_RE = re.compile(
     r'^(\S+) \[([^\]]+)\] "(\S+) (\S+)[^"]*" (\d+) (\d+) ([\d.]+|-) ([\d.]+|-)(?:\s+(\S+))?'
 )
 
+# Real HTTP methods only -- anything else in this capture group means nginx
+# logged raw, unparseable bytes as $request. The most common cause is a TLS
+# ClientHello sent to a plain-HTTP port (routine internet-wide scanning):
+# nginx can't parse a request line out of it, so it logs the handshake bytes
+# verbatim, and this regex's \S+ happily captures a chunk of those bytes as
+# "method". The backend's method field is max 10 chars and rejects the whole
+# batch on one bad event, so filtering here -- same place a line with an
+# unparseable timestamp already gets dropped -- keeps that noise off the wire
+# entirely instead of relying on the backend's 400 and the bisection-retry
+# fallback in _handle_validation_failure to clean it up after the fact.
+VALID_HTTP_METHODS = frozenset(
+    {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT"}
+)
+
 # Nginx error log format:
 # 2026/02/26 10:23:01 [error] 12345#0: *1 message
 # 2026/02/26 10:23:01 [warn]  12345#0: message (no asterisk prefix)
@@ -292,6 +306,10 @@ class NginxLogCollector:
             match.group(8),
             match.group(9),
         )
+
+        # Not a real request line -- see VALID_HTTP_METHODS for why this happens.
+        if method.upper() not in VALID_HTTP_METHODS:
+            return None
 
         # Parse timestamp. Format: 26/Feb/2026:10:23:01 +0000
         try:
