@@ -63,6 +63,25 @@ MAX_EVENTS_PER_BATCH = 200
 QUOTA_BACKOFF_INITIAL_SECONDS = 300
 QUOTA_BACKOFF_MAX_SECONDS = 3600
 
+# Caps how many lines a single read-parse-send-commit round processes per
+# path. Before this, one collect_and_send() cycle read and sent the ENTIRE
+# unread backlog for a path in one all-or-nothing pass -- fine for a normal
+# small hourly delta, but on a source whose offset had fallen far behind
+# (found one 34MB / ~230k-line backlog a month stale), that meant thousands
+# of sequential POSTs in one pass, and a single transient failure anywhere
+# in that pass (one 502 among a thousand requests is close to inevitable)
+# discarded the entire pass's progress -- the whole backlog got re-read and
+# re-sent from scratch next cycle, forever, never catching up. Bounding each
+# round means a transient failure only costs this round's lines; everything
+# already committed in earlier rounds this cycle stays committed.
+MAX_LINES_PER_ROUND = 5000
+
+# Caps how many rounds a single collect_and_send() call will run, so a very
+# large backlog still yields back to the outer collection loop (and its
+# running/shutdown check) periodically instead of blocking it indefinitely.
+# Any backlog beyond this many rounds is simply picked up next cycle.
+MAX_ROUNDS_PER_CYCLE = 20
+
 
 class NginxLogCollector:
     """
@@ -70,16 +89,23 @@ class NginxLogCollector:
     parses new lines since the last collection, and sends raw per-request events
     and error events to the WatchDock backend.
 
-    File read offsets are persisted to disk and only advanced once every
-    event in a cycle's read has either sent successfully or been dropped as
-    permanently unparseable (see _handle_validation_failure) -- so a process
-    restart or a transient/oversized-send failure never silently drops log
-    lines, and a single malformed line can't block the offset forever either.
+    File read offsets are persisted to disk and only advanced, one bounded
+    round at a time (see MAX_LINES_PER_ROUND), once every event in that
+    round has either sent successfully or been dropped as permanently
+    unparseable (see _handle_validation_failure) -- so a process restart or
+    a transient/oversized-send failure never silently drops log lines, and
+    a single malformed line can't block the offset forever either. Rounds
+    are bounded specifically so a large backlog (a source whose offset has
+    fallen far behind) commits progress incrementally instead of needing
+    its entire unread backlog to send successfully in one all-or-nothing
+    pass -- otherwise a single transient failure anywhere in that pass
+    (increasingly likely the more requests a pass needs) would discard the
+    whole thing and restart the backlog from scratch next cycle, forever.
     When a path is shared by multiple sources
     (e.g. filtered by different path prefixes), the offset for that path only
-    advances once every source that reads it has sent successfully — a
-    partial failure just means some events get retried next cycle rather
-    than lost.
+    advances once every source that reads it has sent successfully within
+    that round — a partial failure just means some events get retried next
+    round or next cycle rather than lost.
 
     A source whose organization is over its plan's monthly nginx-log limit
     gets backed off (see QUOTA_BACKOFF_*) instead of being retried every
@@ -163,16 +189,37 @@ class NginxLogCollector:
 
     def collect_and_send(self) -> None:
         """
-        Called once per nginx_interval. For every configured NginxLogSource,
-        reads new lines from its access and error log files, parses them,
-        and sends to the backend. A file's read offset only advances once
-        every source referencing it has sent its events successfully.
+        Called once per nginx_interval. Runs bounded rounds of read-parse-
+        send-commit (see MAX_LINES_PER_ROUND) for every configured
+        NginxLogSource, back to back, until every active path has caught up
+        to the current end of file or MAX_ROUNDS_PER_CYCLE is hit, whichever
+        comes first. A source whose offset is only a normal cycle's delta
+        behind finishes in a single round, same as before; a source with a
+        large backlog drains it in bounded, incrementally-committed slices
+        instead of one all-or-nothing pass over the whole thing.
         """
         nginx_sources = self.config.get("nginx_sources", [])
         if not nginx_sources:
             return
 
-        # A path is "active" this cycle only if every source referencing it
+        for _ in range(MAX_ROUNDS_PER_CYCLE):
+            if not self._run_round(nginx_sources):
+                break
+
+    def _run_round(self, nginx_sources: List[dict]) -> bool:
+        """
+        Runs one bounded read-parse-send-commit round across every
+        configured source. Returns True if any path that succeeded this
+        round still has more content beyond MAX_LINES_PER_ROUND waiting
+        (i.e. collect_and_send should run another round), False otherwise.
+
+        A path whose round failed is deliberately excluded from that check:
+        it's left to retry on the normal next-cycle cadence (the collection
+        loop's sleep(nginx_interval)) rather than being retried immediately
+        in a tight loop, which would just hammer the same transient failure
+        again with no backoff.
+        """
+        # A path is "active" this round only if every source referencing it
         # is within its plan's limit. If even one is backed off, the whole
         # path is skipped rather than reading it for its healthy sibling:
         # the offset is committed per-path (see below), so advancing it on
@@ -190,11 +237,12 @@ class NginxLogCollector:
             if not any(self._is_backed_off(s["id"]) for s in sources)
         }
 
-        # Read each unique active file path exactly once per cycle. Reading
-        # does not mutate self._file_positions yet — that only happens once
-        # we know every consumer of a path succeeded.
-        access_lines_by_path: Dict[str, Tuple[List[str], int]] = {}
-        error_lines_by_path: Dict[str, Tuple[List[str], int]] = {}
+        # Read each unique active file path exactly once per round, capped
+        # at MAX_LINES_PER_ROUND. Reading does not mutate self._file_positions
+        # yet — that only happens once we know every consumer of a path
+        # succeeded.
+        access_lines_by_path: Dict[str, Tuple[List[str], int, bool]] = {}
+        error_lines_by_path: Dict[str, Tuple[List[str], int, bool]] = {}
         path_succeeded: Dict[str, bool] = {}
 
         for source in nginx_sources:
@@ -203,7 +251,7 @@ class NginxLogCollector:
                 (error_lines_by_path, source["error_log_path"]),
             ]:
                 if path not in store and path in active_paths:
-                    store[path] = self._read_new_lines(path)
+                    store[path] = self._read_new_lines(path, max_lines=MAX_LINES_PER_ROUND)
                     path_succeeded[path] = True
 
         # Process each source with its collected lines.
@@ -212,48 +260,59 @@ class NginxLogCollector:
             prefix = source.get("filter_path_prefix", "")
 
             access_path = source["access_log_path"]
-            access_lines, _ = access_lines_by_path.get(access_path, ([], 0))
+            access_lines, _, _ = access_lines_by_path.get(access_path, ([], 0, False))
             events = self._parse_access_lines(access_lines, prefix)
             if events and not self._send_access_events(source_id, events):
                 path_succeeded[access_path] = False
 
             error_path = source["error_log_path"]
-            error_lines, _ = error_lines_by_path.get(error_path, ([], 0))
+            error_lines, _, _ = error_lines_by_path.get(error_path, ([], 0, False))
             error_events = self._parse_error_lines(error_lines)
             if error_events and not self._send_error_events(source_id, error_events):
                 path_succeeded[error_path] = False
 
         # Commit offsets only for paths where every source that reads them
-        # sent successfully this cycle. Anything else is retried next cycle,
+        # sent successfully this round. Anything else is retried next cycle,
         # which may re-send already-delivered events for other sources of a
         # shared path — duplicates are an acceptable tradeoff for never
         # silently losing data.
         changed = False
-        for path, (_, new_position) in {**access_lines_by_path, **error_lines_by_path}.items():
-            if path_succeeded.get(path, True) and self._file_positions.get(path) != new_position:
+        more_available = False
+        for path, (_, new_position, path_more) in {**access_lines_by_path, **error_lines_by_path}.items():
+            if not path_succeeded.get(path, True):
+                continue
+            if self._file_positions.get(path) != new_position:
                 self._file_positions[path] = new_position
                 changed = True
+            if path_more:
+                more_available = True
 
         if changed:
             self._save_positions()
+
+        return more_available
 
     # ------------------------------------------------------------------
     # File reading
     # ------------------------------------------------------------------
 
-    def _read_new_lines(self, path: str) -> Tuple[List[str], int]:
+    def _read_new_lines(self, path: str, max_lines: Optional[int] = None) -> Tuple[List[str], int, bool]:
         """
-        Read new lines from a log file since the last recorded offset.
-        Handles log rotation by resetting to offset 0 when the file shrinks.
-        Returns (lines, candidate_new_offset) without committing the offset —
-        callers commit it only after a successful send. Returns ([], last
-        known offset) if the file does not exist or cannot be read, so a
-        transient read error never advances the persisted position.
+        Read new lines from a log file since the last recorded offset,
+        capped at max_lines if given. Handles log rotation by resetting to
+        offset 0 when the file shrinks. Returns (lines, candidate_new_offset,
+        more_available) without committing the offset — callers commit it
+        only after a successful send. more_available is True when the cap
+        was hit before reaching the file's current end, so the caller knows
+        there's another round's worth of backlog still to read. Returns
+        ([], last known offset, False) if the file does not exist or cannot
+        be read, so a transient read error never advances the persisted
+        position.
         """
         last_position = self._file_positions.get(path, 0)
 
         if not os.path.exists(path):
-            return [], last_position
+            return [], last_position, False
 
         try:
             current_size = os.path.getsize(path)
@@ -265,22 +324,34 @@ class NginxLogCollector:
 
             # No new content.
             if current_size <= last_position:
-                return [], last_position
+                return [], last_position, False
 
             lines: List[str] = []
             with open(path, "r", errors="replace") as f:
                 f.seek(last_position)
-                for line in f:
-                    stripped = line.strip()
+                # readline(), not `for line in f`: iterating a file object
+                # read-ahead-buffers internally, which makes f.tell() raise
+                # ("telling position disabled by next() call") the moment we
+                # break out early instead of exhausting the iterator to EOF.
+                # readline() has no such buffering, so tell() stays accurate
+                # after a capped partial read too.
+                while True:
+                    raw_line = f.readline()
+                    if not raw_line:
+                        break
+                    stripped = raw_line.strip()
                     if stripped:
                         lines.append(stripped)
+                    if max_lines is not None and len(lines) >= max_lines:
+                        break
                 new_position = f.tell()
 
-            return lines, new_position
+            more_available = new_position < current_size
+            return lines, new_position, more_available
 
         except Exception as e:
             self.logger.error(f"Error reading nginx log file {path}: {e}")
-            return [], last_position
+            return [], last_position, False
 
     # ------------------------------------------------------------------
     # Access log parsing
