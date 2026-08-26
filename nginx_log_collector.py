@@ -56,9 +56,12 @@ class NginxLogCollector:
     parses new lines since the last collection, and sends raw per-request events
     and error events to the WatchDock backend.
 
-    File read offsets are persisted to disk and only advanced after a
-    successful send, so a process restart or a failed/oversized send never
-    silently drops log lines. When a path is shared by multiple sources
+    File read offsets are persisted to disk and only advanced once every
+    event in a cycle's read has either sent successfully or been dropped as
+    permanently unparseable (see _handle_validation_failure) -- so a process
+    restart or a transient/oversized-send failure never silently drops log
+    lines, and a single malformed line can't block the offset forever either.
+    When a path is shared by multiple sources
     (e.g. filtered by different path prefixes), the offset for that path only
     advances once every source that reads it has sent successfully — a
     partial failure just means some events get retried next cycle rather
@@ -413,11 +416,43 @@ class NginxLogCollector:
 
             if response.status_code == 429:
                 self._register_quota_exceeded(source_id)
-            else:
-                self.logger.warning(
-                    f"Failed to send {endpoint}: {response.status_code} - {response.text[:500]}"
-                )
+                return False
+
+            if response.status_code == 400:
+                return self._handle_validation_failure(endpoint, source_id, events, response)
+
+            self.logger.warning(
+                f"Failed to send {endpoint}: {response.status_code} - {response.text[:500]}"
+            )
             return False
         except Exception as e:
             self.logger.error(f"Error sending {endpoint}: {e}")
             return False
+
+    def _handle_validation_failure(
+        self, endpoint: str, source_id: str, events: List[dict], response: "requests.Response"
+    ) -> bool:
+        """A 400 means the backend rejected this exact payload and will keep
+        rejecting it on every retry -- one malformed line (e.g. a bad
+        $remote_addr from a misconfigured log_format) used to poison-pill the
+        whole source forever, since the read offset only advances on success
+        and the same unsendable chunk got re-read and re-sent every cycle
+        indefinitely.
+
+        A single event can't be sent piecemeal, so if the chunk is down to
+        one it's unrecoverable: log it and treat it as handled so the offset
+        can advance past it. Otherwise bisect and retry each half -- this
+        isolates whichever event(s) are actually malformed and still
+        delivers everything else in the chunk instead of dropping it wholesale.
+        """
+        if len(events) == 1:
+            self.logger.error(
+                f"Dropping unparseable {endpoint} event for source {source_id} "
+                f"(backend rejected it: {response.text[:300]}): {events[0]}"
+            )
+            return True
+
+        mid = len(events) // 2
+        left_ok = self._post_events(endpoint, source_id, events[:mid])
+        right_ok = self._post_events(endpoint, source_id, events[mid:])
+        return left_ok and right_ok
