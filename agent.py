@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import List, Dict
 from config import Config
 
-AGENT_VERSION = "1.4.5"
+AGENT_VERSION = "1.4.6"
 
 try:
     import psutil
@@ -108,15 +108,15 @@ class ObservabilityAgent:
         else:
             self.logger.info("Docker container monitoring disabled")
 
-        # Start container log collection thread (if enabled and Docker available)
-        if (self.config.get('collect_container_logs', True) and
-            CONTAINER_LOG_COLLECTOR_AVAILABLE and self.container_log_collector):
+        # Always start the loop: collect_container_logs is toggled per server and re-read each pass
+        if CONTAINER_LOG_COLLECTOR_AVAILABLE and self.container_log_collector:
             log_collector_thread = threading.Thread(target=self._container_log_collection_loop)
             log_collector_thread.daemon = True
             log_collector_thread.start()
-            self.logger.info("Container log collection enabled")
+            state = "enabled" if self.config.get('collect_container_logs', True) else "off until enabled for this server"
+            self.logger.info(f"Container log collection {state}")
         else:
-            self.logger.info("Container log collection disabled")
+            self.logger.info("Container log collection unavailable")
 
         # Start Docker command polling thread (always runs when Docker is available)
         if DOCKER_MONITOR_AVAILABLE and self.docker_monitor and self.docker_monitor.docker_available:
