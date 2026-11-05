@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 from typing import List, Dict
 from config import Config
 
-AGENT_VERSION = "1.4.6"
+AGENT_VERSION = "1.4.7"
+COMMAND_LAUNCH_DELAY = 5  # seconds; lets the command result post before the service stops
 
 try:
     import psutil
@@ -118,12 +119,11 @@ class ObservabilityAgent:
         else:
             self.logger.info("Container log collection unavailable")
 
-        # Start Docker command polling thread (always runs when Docker is available)
-        if DOCKER_MONITOR_AVAILABLE and self.docker_monitor and self.docker_monitor.docker_available:
-            cmd_thread = threading.Thread(target=self._docker_command_loop)
-            cmd_thread.daemon = True
-            cmd_thread.start()
-            self.logger.info("Docker command execution enabled")
+        # Always poll: agent commands (update/restart) work without Docker
+        cmd_thread = threading.Thread(target=self._docker_command_loop)
+        cmd_thread.daemon = True
+        cmd_thread.start()
+        self.logger.info("Command execution enabled")
 
         # Start nginx log collection thread (collect_and_send handles empty sources gracefully)
         if NGINX_LOG_COLLECTOR_AVAILABLE and self.nginx_log_collector:
@@ -434,6 +434,11 @@ class ObservabilityAgent:
         container_id = cmd.get("container_id", "")
         container_name = cmd.get("container_name", "") or container_id
 
+        if action in ("update_agent", "restart_agent"):
+            ok, message = self._perform_update() if action == "update_agent" else self._schedule_restart()
+            self._report_command(command_id, "completed" if ok else "failed", message, api_token)
+            return
+
         if action == "prune":
             cmd_args = ["docker", "system", "prune", "-f"]
             log_label = "system"
@@ -463,6 +468,10 @@ class ObservabilityAgent:
             result_status = "failed"
             message = str(exc)
 
+        self._report_command(command_id, result_status, message, api_token)
+        self.logger.info(f"docker {action} {log_label}: {result_status} — {message[:120]}")
+
+    def _report_command(self, command_id, result_status, message, api_token):
         try:
             requests.post(
                 f"{self.config.get('api_endpoint')}/core/agent/docker-commands/{command_id}/result/",
@@ -473,7 +482,34 @@ class ObservabilityAgent:
         except Exception as e:
             self.logger.warning(f"Failed to report command result: {e}")
 
-        self.logger.info(f"docker {action} {log_label}: {result_status} — {message[:120]}")
+    def _schedule_restart(self):
+        """Restart via a delayed transient unit so the result is reported before this process stops."""
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                [
+                    "systemd-run",
+                    "--unit=watchdock-agent-restart",
+                    "--collect",
+                    f"--on-active={COMMAND_LAUNCH_DELAY}",
+                    "--",
+                    "systemctl",
+                    "restart",
+                    "watchdock-agent",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except Exception as e:
+            self.logger.error(f"Restart failed: {e}")
+            return False, f"Couldn't schedule restart: {e}"
+        if result.returncode != 0:
+            self.logger.error(f"Failed to schedule restart: {result.stderr[:500]}")
+            return False, result.stderr.strip()[:500] or "systemd-run failed"
+        self.logger.info(f"Restart scheduled in {COMMAND_LAUNCH_DELAY}s")
+        return True, f"Restart scheduled in {COMMAND_LAUNCH_DELAY}s. The agent reports again once it's back."
 
     def _nginx_log_collection_loop(self):
         """Periodically collect and send nginx access metrics and error events"""
@@ -547,13 +583,13 @@ class ObservabilityAgent:
             with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
                 f.write(resp.text)
                 script_path = f.name
-            import os
             os.chmod(script_path, 0o755)
             result = subprocess.run(
                 [
                     "systemd-run",
                     "--unit=watchdock-agent-upgrade",
                     "--collect",
+                    f"--on-active={COMMAND_LAUNCH_DELAY}",
                     "--",
                     "bash",
                     script_path,
@@ -562,15 +598,17 @@ class ObservabilityAgent:
                 text=True,
                 timeout=15,
             )
-            if result.returncode == 0:
-                self.logger.info(
-                    "Auto-update launched in a detached scope — this process and the "
-                    "old service will stop shortly; the new version starts automatically"
-                )
-            else:
-                self.logger.error(f"Failed to launch auto-update: {result.stderr[:500]}")
         except Exception as e:
             self.logger.error(f"Auto-update failed: {e}")
+            return False, f"Couldn't launch the update: {e}"
+        if result.returncode != 0:
+            self.logger.error(f"Failed to launch auto-update: {result.stderr[:500]}")
+            return False, result.stderr.strip()[:500] or "systemd-run failed"
+        self.logger.info(
+            "Auto-update launched in a detached unit — this process and the "
+            "old service will stop shortly; the new version starts automatically"
+        )
+        return True, f"Update starts in {COMMAND_LAUNCH_DELAY}s from v{AGENT_VERSION}. The agent reports its new version once it's back."
 
     def _send_startup_event(self):
         """Notify the platform immediately that this agent has started."""
