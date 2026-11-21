@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 LETSENCRYPT_RENEWAL = "/etc/letsencrypt/renewal"
 LETSENCRYPT_LOG = "/var/log/letsencrypt/letsencrypt.log"
+GLOBAL_HOOK_DIRS = ("/etc/letsencrypt/renewal-hooks/deploy", "/etc/letsencrypt/renewal-hooks/post")
 NGINX_CONF_GLOBS = (
     "/etc/nginx/nginx.conf",
     "/etc/nginx/sites-enabled/*",
@@ -108,6 +109,7 @@ def none_if_unset(value: Optional[str]) -> Optional[str]:
 
 
 def certbot_certs() -> List[Dict]:
+    global_hook = any(os.listdir(d) for d in GLOBAL_HOOK_DIRS if os.path.isdir(d))
     certs = []
     for conf_path in sorted(glob.glob(os.path.join(LETSENCRYPT_RENEWAL, "*.conf"))):
         parser = configparser.ConfigParser(interpolation=None)
@@ -129,7 +131,8 @@ def certbot_certs() -> List[Dict]:
             "renewer": "certbot",
             "authenticator": none_if_unset(params.get("authenticator")),
             "installer": none_if_unset(params.get("installer")),
-            "has_deploy_hook": bool(params.get("renew_hook") or params.get("deploy_hook") or params.get("post_hook")),
+            "has_deploy_hook": global_hook
+            or bool(params.get("renew_hook") or params.get("deploy_hook") or params.get("post_hook")),
         })
     return certs
 
