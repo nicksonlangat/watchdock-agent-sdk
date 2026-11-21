@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import List, Dict
 from config import Config
 
-AGENT_VERSION = "1.4.7"
+AGENT_VERSION = "1.5.0"
 COMMAND_LAUNCH_DELAY = 5  # seconds; lets the command result post before the service stops
 
 try:
@@ -45,6 +45,12 @@ except ImportError:
     NGINX_LOG_COLLECTOR_AVAILABLE = False
     print("Warning: Nginx log collector not available.")
 
+try:
+    from cert_collector import CertCollector
+    CERT_COLLECTOR_AVAILABLE = True
+except ImportError:
+    CERT_COLLECTOR_AVAILABLE = False
+
 class ObservabilityAgent:
     def __init__(self):
         self.config = Config()
@@ -68,6 +74,8 @@ class ObservabilityAgent:
             self.nginx_log_collector = NginxLogCollector(self.config)
         else:
             self.nginx_log_collector = None
+
+        self.cert_collector = CertCollector(self.config) if CERT_COLLECTOR_AVAILABLE else None
 
         logging.basicConfig(
             level=getattr(logging, self.config.get('log_level', 'INFO')),
@@ -133,6 +141,12 @@ class ObservabilityAgent:
             self.logger.info("Nginx log collection enabled")
         else:
             self.logger.info("Nginx log collection disabled")
+
+        if self.cert_collector:
+            cert_thread = threading.Thread(target=self._cert_collection_loop)
+            cert_thread.daemon = True
+            cert_thread.start()
+            self.logger.info("Certificate reporting enabled")
 
         if self.config.get('auto_update', False):
             self.logger.info("Auto-update enabled — will check for new versions on each config refresh")
@@ -522,6 +536,14 @@ class ObservabilityAgent:
             except Exception as e:
                 self.logger.error(f"Error in nginx log collection loop: {e}")
             time.sleep(self.config.get('nginx_interval', 60))
+
+    def _cert_collection_loop(self):
+        while self.running:
+            try:
+                self.cert_collector.collect_and_send()
+            except Exception as e:
+                self.logger.error(f"Error in certificate collection loop: {e}")
+            time.sleep(self.config.get('cert_interval', 3600))
 
     def _check_for_update(self):
         """Check if a newer agent version is available and self-update if so."""
